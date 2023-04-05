@@ -8,9 +8,13 @@
 #include <tuple>
 #include <unordered_map>
 
-using input_t = std::tuple<std::vector<uint32_t>, std::vector<uint32_t>>;
+#include "timers.h"
 
-input_t &&read_input(char* filename) {
+using input_t = std::tuple<std::vector<uint32_t>, std::vector<uint32_t>, uint32_t>;
+
+input_t read_input(char* filename) {
+  CpuTimer timer("read_input");
+
   std::ifstream file(filename);
 
   if (!file.is_open()) {
@@ -44,7 +48,7 @@ input_t &&read_input(char* filename) {
     B.push_back(b);
   }
 
-  return std::move(std::make_tuple(A, B));
+  return std::make_tuple(A, B, mapper.size() + 1);
 }
 
 #endif // __INPUT_H__
