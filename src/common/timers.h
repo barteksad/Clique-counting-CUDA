@@ -11,7 +11,7 @@ class CpuTimer
 {
 public:
   CpuTimer(std::string name) 
-    : start_(clock::now()) {}
+    : name(name), start_(clock::now()) {}
   void reset() { start_ = clock::now(); }
   double elapsed() const
   {

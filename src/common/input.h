@@ -48,7 +48,7 @@ input_t read_input(char* filename) {
     B.push_back(b);
   }
 
-  return std::make_tuple(A, B, mapper.size() + 1);
+  return std::make_tuple(A, B, mapper.size());
 }
 
 #endif // __INPUT_H__
