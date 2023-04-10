@@ -18,7 +18,8 @@ std::vector<uint32_t> histogram_cpu(const std::vector<uint32_t>&A, const std::ve
 void grap_orientation_cpu(std::vector<uint32_t>&A, std::vector<uint32_t>&B, std::vector<uint32_t> hist) {
   CpuTimer timer("grap orientation cpu");
   for(uint32_t i=0; i<A.size(); i++) {
-      if(hist[A[i]] >= hist[B[i]]) {
+      if(hist[A[i]] > hist[B[i]]) {
+        hist[A[i]]--;
         uint32_t tmp = A[i];
         A[i] = B[i];
         B[i] = tmp;

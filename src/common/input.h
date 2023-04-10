@@ -24,10 +24,8 @@ input_t read_input(char* filename) {
   std::vector<uint32_t> A, B;
   std::unordered_map<uint32_t, uint32_t> mapper;
 
-  while(!file.eof()) {
-    uint32_t a, b;
-    file >> a >> b;
-
+  uint32_t a, b;
+  while((file >> a >> b)) {
     auto it = mapper.find(a);
     if (it == mapper.end()) {
       mapper.emplace(a, mapper.size());
