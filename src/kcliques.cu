@@ -1,12 +1,14 @@
 #include <stdlib.h>
+#include <assert.h>
 #include <thrust/sort.h>
+#include <cooperative_groups.h>
 
 #include "./common/input.h"
 #include "./common/helpers.h"
 #include "./common/timers.h"
 #include "./common/cpu_tests.h"
 
-#include <assert.h>
+namespace cg = cooperative_groups;
 
 #define HIST_ELEM_PER_THREAD 100
 #define HIST_THREADS 1024
@@ -37,40 +39,6 @@ __global__ void graph_orientation(uint32_t *edges_a, uint32_t *edges_b, long siz
     i += blockDim.x;
   }
 }
-// #define ORIENT_ELEM_PER_THREAD HIST_ELEM_PER_THREAD
-// #define ORIENT_THREADS HIST_THREADS
-// __global__ void graph_orientation(uint32_t *edges_a, uint32_t *edges_b, long size, uint32_t *histo, unsigned short int *spins) {
-//   int i = threadIdx.x + (blockIdx.x * blockDim.x * ORIENT_ELEM_PER_THREAD);
-//   for(int j = 0; j < ORIENT_ELEM_PER_THREAD; j++) {
-//     if(i < size) {
-//       bool success = false;
-//       while(!success) {
-//         if(atomicCAS(&spins[edges_a[i]], 1, 0) == 1) {
-          
-//           if(atomicCAS(&spins[edges_b[i]], 1, 0) == 1) {
-//             if(histo[edges_a[i]] > histo[edges_b[i]]) {
-//               histo[edges_b[i]]++;
-//               spins[edges_a[i]] = 1;
-//               spins[edges_b[i]] = 1;
-//               uint32_t tmp = edges_a[i];
-//               edges_a[i] = edges_b[i];
-//               edges_b[i] = tmp;
-//             } else {
-//               histo[edges_a[i]]++;
-//               spins[edges_a[i]] = 1;
-//               spins[edges_b[i]] = 1;
-//             }
-//             success = true;
-//           } else {
-//             spins[edges_a[i]] = 1;
-//           } // spinlock b
-
-//         } // spinlock a
-//       }
-//     }
-//     i += blockDim.x;
-//   }
-// }
 
 struct CSR {
   uint32_t *row_array;
@@ -80,9 +48,9 @@ struct CSR {
 };
 
 #define D_OUT_MAX 1024U
-#define SUB_WARP_SIZE 32U
+#define SUB_WARP_SIZE 16U
 // OA - orientation approach
-#define OA_WARP_GROUPS 4U
+#define OA_WARP_GROUPS 32U
 #define OA_THREADS OA_WARP_GROUPS * SUB_WARP_SIZE
 static_assert(SUB_WARP_SIZE && !(SUB_WARP_SIZE & (SUB_WARP_SIZE - 1)));
 static_assert(D_OUT_MAX % 32 == 0);
@@ -146,26 +114,19 @@ __global__ void graph_orientation_approach(
   }
   __syncthreads();
 
-  // if(tid == 0) {
-  //   printf("vertex_idx: %u\n, n_neighbors: %u\n", vertex_idx, n_neighbors);
-  // }
-
   __shared__ uint32_t curr_neighbor_to_check[OA_WARP_GROUPS][K_MAX - 2];
   __shared__ uint32_t next_possible_neighbor[OA_WARP_GROUPS];
-  // __shared__ uint32_t dfs_vertex[OA_WARP_GROUPS][K_MAX - 2];
   __shared__ uint32_t intersections[OA_WARP_GROUPS][K_MAX - 2][D_OUT_MAX / 32];
+
   for(uint32_t warp_subtree = sub_warp_id; warp_subtree < n_neighbors; warp_subtree += OA_WARP_GROUPS) {
     for(uint32_t i = sub_warp_tid; i < K_MAX - 2; i += SUB_WARP_SIZE) {
       curr_neighbor_to_check[sub_warp_id][i] = 0;
     }
-    // if(sub_warp_tid == 0) {
-    //   dfs_vertex[sub_warp_id][0] = warp_subtree;
-    // }
-    // copy intersection of neighbors of warp_subtree
+
     for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
       intersections[sub_warp_id][0][i] = induced_sub_graph[isg_offset + warp_subtree * (D_OUT_MAX / 32) + i];
     }
-    // __syncthreads();
+
     __syncwarp();
     for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
       uint64_t n_neighbors_k = __popc(intersections[sub_warp_id][0][i]);
@@ -173,27 +134,26 @@ __global__ void graph_orientation_approach(
         atomicAdd(&K_local[0], n_neighbors_k);
       }
     }
-    // __syncthreads();
+
     __syncwarp();
 
     uint32_t curr_k = 3;
     while(curr_k >= 2) {
-      // __syncwarp();
       if(curr_k == K) {
         curr_k--;
+        if(curr_k == 2) {
+          break;
+        }
       }
+
       // find first non zero bit in to_check >= prev_check
       uint32_t prev = curr_neighbor_to_check[sub_warp_id][curr_k - 3];
-      __syncwarp();
-      // __syncthreads();
       if(sub_warp_tid == 0) {
         next_possible_neighbor[sub_warp_id] = UINT32_MAX;
       }
       __syncwarp();
-      // __syncthreads();
 
       for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
-        // uint32_t x = induced_sub_graph[isg_offset + dfs_vertex[sub_warp_id][curr_k - 3] * (D_OUT_MAX / 32) + i];
         uint32_t x = intersections[sub_warp_id][curr_k - 3][i];
         if(x == 0) {
           continue;
@@ -211,16 +171,9 @@ __global__ void graph_orientation_approach(
         }
       }
       __syncwarp();
-      // __syncthreads();
 
       // if no next possible neighbor, backtrack
       uint32_t next = next_possible_neighbor[sub_warp_id];
-      // if(vertex_idx == 0 && sub_warp_tid == 0 && curr_k == 4) {
-      //   printf("vertex_idx: %u, curr_k: %u, prev: %u, next: %u warp id: %u\n\n", vertex_idx, curr_k, prev, next, sub_warp_id);
-      // }
-      // if(sub_warp_tid == 0) {
-      //   curr_neighbor_to_check[sub_warp_id][curr_k - 3] = prev + 1;
-      // }
       if(next == UINT32_MAX) {
         // backtrack
         if(sub_warp_tid == 0) {
@@ -228,50 +181,28 @@ __global__ void graph_orientation_approach(
         }
         curr_k--;
         if(curr_k == 2) {
-          // if(vertex_idx == 0 && sub_warp_tid == 0)
-          //   printf("vertex_idx: %u, break with prev: %d\n", vertex_idx, prev);
           break;
         }
         continue;
       }
 
       __syncwarp();
-      // __syncthreads();
 
       if(sub_warp_tid == 0) {
         curr_neighbor_to_check[sub_warp_id][curr_k - 3] = next + 1;
       }
 
-      // increment kclique counter
-      // for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
-      //   int n_neighbors = __popc(intersections[sub_warp_id][curr_k - 3][i]);
-      //   if(n_neighbors > 0) {
-      //     atomicAdd(&K_local[curr_k - 3], (uint64_t) n_neighbors);
-      //   }
-      // }
-      // if(sub_warp_tid == 0) {
-      //   atomicAdd(&K_local[curr_k - 3], (uint64_t) 1);
-      // }
-
-      // if(sub_warp_tid == 0) {
-      //   dfs_vertex[sub_warp_id][curr_k - 2] = next;
-      // }
-
       for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
-        // intersections[sub_warp_id][curr_k - 2][i] = induced_sub_graph[isg_offset + dfs_vertex[sub_warp_id][curr_k - 3] * (D_OUT_MAX / 32) + i] & induced_sub_graph[isg_offset + next * (D_OUT_MAX / 32) + i];
         intersections[sub_warp_id][curr_k - 2][i] = intersections[sub_warp_id][curr_k - 3][i] & induced_sub_graph[isg_offset + next * (D_OUT_MAX / 32) + i];
       }
       __syncwarp();
-      // __syncthreads();
+
       for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
         uint64_t n_neighbors_k = __popc(intersections[sub_warp_id][curr_k - 2][i]);
         if(n_neighbors_k > 0) {
-          // if(curr_k == 4)
-          //   printf("K = %d vertex: %u n_neighbors_k: %llu  paths: %u %u\n", curr_k, vertex_idx, n_neighbors_k, curr_neighbor_to_check[sub_warp_id][0], curr_neighbor_to_check[sub_warp_id][1]);
           atomicAdd(&K_local[curr_k - 2], n_neighbors_k);
         }
       }
-      __syncwarp();
       curr_k++;
     }
   }
@@ -281,13 +212,6 @@ __global__ void graph_orientation_approach(
   for(uint32_t i = tid; i < K_MAX - 2; i += blockDim.x) {
     atomicAdd(&K_global[i], K_local[i] % 1000000000);
   }
-  // print induced subgraph
-  // if(tid == 0) {
-  //   printf("vertex %u: , induced[0][0]: %d induced[1][0]: %d, induced[2][0]: %d, induced[3][0]: %d, induced[4][0]: %d, induced[5][0]: %d, induced[6][0]: %d\n",
-  //     vertex_idx, 
-  //     induced_sub_graph[isg_offset + 0], induced_sub_graph[isg_offset + 32], induced_sub_graph[isg_offset + 64],
-  //     induced_sub_graph[isg_offset + 96], induced_sub_graph[isg_offset + 128], induced_sub_graph[isg_offset + 160], induced_sub_graph[isg_offset + 192]);
-  // }
 }
 
 
@@ -324,8 +248,10 @@ int main(int argc, char *argv[]) {
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
   int blocks = prop.multiProcessorCount * 4;
   int warps = prop.warpSize;
+  #ifdef DEBUG
   printf("warps: %d\n", warps);
   printf("blocks: %d\n", blocks);
+  #endif // DEBUG
 
   // compute histogram to count nodes degrees
   uint32_t *host_hist;
@@ -400,40 +326,6 @@ int main(int argc, char *argv[]) {
     csr.n_edges = n_edges;
   }
 
-  #ifdef DEBUG
-  auto [row_array, col_array] = csr_cpu(A, B, n_vertex);
-  uint32_t *host_row_array, *host_col_array;
-  HANDLE_ERROR(cudaHostAlloc((void**)&host_row_array, CSR_row_size * sizeof(uint32_t), cudaHostAllocDefault));
-  HANDLE_ERROR(cudaHostAlloc((void**)&host_col_array, n_edges * sizeof(uint32_t), cudaHostAllocDefault));
-  HANDLE_ERROR(cudaMemcpyAsync(host_row_array, csr.row_array, CSR_row_size * sizeof(uint32_t), cudaMemcpyDeviceToHost, streams[0]));
-  HANDLE_ERROR(cudaMemcpyAsync(host_col_array, csr.col_array, n_edges * sizeof(uint32_t), cudaMemcpyDeviceToHost, streams[1]));
-  sync_streams(streams, 2);
-
-  // std::cout << "CSR row array:\n";
-  // for(auto i = 0; i < CSR_row_size; i++) {
-  //   std::cout << host_row_array[i] << " ";
-  // }
-  // std::cout << "\n";
-  // std::cout << "CSR col array:\n";
-  // for(auto i = 0; i < n_edges; i++) {
-  //   std::cout << host_col_array[i] << " ";
-  // }
-  // std::cout << "\n";
-  // std::cout << "CSR n_vertex: " << n_vertex << "\n";
-  // std::cout << "CSR n_edges: " << n_edges << "\n";
-
-  // for(auto i = 0; i < CSR_row_size; i++) {
-  //   assert(row_array[i] == host_row_array[i]);
-  // }
-  // for(auto i = 0; i < n_edges; i++) {
-  //   assert(col_array[i] == host_col_array[i]);
-  // }
-  // std::cout << "CSR on CPU and GPU match!\n";
-
-  cudaFreeHost(host_row_array);
-  cudaFreeHost(host_col_array);
-  #endif // DEBUG
-
   // orientation approach
   unsigned long long int *K_global_dev;
   unsigned long long int *K_global_host;
@@ -449,7 +341,6 @@ int main(int argc, char *argv[]) {
       graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[0]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph);
       sync_streams(streams, 1);
     }
-    sync_streams(streams, 2);
     HANDLE_ERROR(cudaMemcpyAsync(K_global_host, K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[0]));
     sync_streams(streams, 1);
     cudaFree(induced_sub_graph);
