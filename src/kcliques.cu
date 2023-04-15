@@ -48,9 +48,9 @@ struct CSR {
 };
 
 #define D_OUT_MAX 1024U
-#define SUB_WARP_SIZE 8U
+#define SUB_WARP_SIZE 4U
 // OA - orientation approach
-#define OA_WARP_GROUPS 32U
+#define OA_WARP_GROUPS 64U
 #define OA_THREADS OA_WARP_GROUPS * SUB_WARP_SIZE
 static_assert(SUB_WARP_SIZE && !(SUB_WARP_SIZE & (SUB_WARP_SIZE - 1)));
 static_assert(D_OUT_MAX % 32 == 0);
@@ -232,7 +232,10 @@ int main(int argc, char *argv[]) {
   std::cout << "K: " << K << std::endl;
   const std::string out_file_path = argv[3];
 
-  const auto [A, B, n_vertex] = read_input(argv[1]);
+  std::vector<uint32_t> A, B;
+  uint32_t n_vertex;
+  std::cout << "Reading input file: " << argv[1] << std::endl;
+  std::tie(A, B, n_vertex) = read_input(argv[1]);
   const int n_edges = A.size();
   // we can create histogram array with one more element to use it later as row array for CSR format
   const int CSR_row_size = n_vertex + 1;
@@ -248,8 +251,9 @@ int main(int argc, char *argv[]) {
   
   cudaDeviceProp prop;
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
+  std::cout << prop.concurrentKernels << " concurrentKernels\n";
+  std::cout << prop.multiProcessorCount << " multiProcessorCount\n";
   int blocks = prop.multiProcessorCount * 4;
-  std::cout << prop.concurrentKernels << " concurrent kernels\n";
   int warps = prop.warpSize;
   #ifdef DEBUG
   printf("warps: %d\n", warps);
@@ -334,16 +338,19 @@ int main(int argc, char *argv[]) {
   unsigned long long int *K_global_host;
   {
     CudaTimer oa_timer("orientation_approach");
-    HANDLE_ERROR(cudaMalloc((void**)&K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int)));
     uint32_t *induced_sub_graph;
+
+    HANDLE_ERROR(cudaMalloc((void**)&K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int)));
     HANDLE_ERROR(cudaMalloc((void**)&induced_sub_graph, blocks * D_OUT_MAX * (D_OUT_MAX / 32) * sizeof(uint32_t)));
     HANDLE_ERROR(cudaHostAlloc((void**)&K_global_host, (K_MAX - 2) * sizeof(unsigned long long int), cudaHostAllocDefault));
     HANDLE_ERROR(cudaMemset(K_global_dev, 0, (K_MAX - 2) * sizeof(unsigned long long int)));
+
     for(uint32_t vertex_idx = 0; vertex_idx < n_vertex; vertex_idx += blocks) {
       int n_blocks = std::min(n_vertex - vertex_idx, (uint32_t)blocks);
       graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[0]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph);
       sync_streams(streams, 1);
     }
+
     HANDLE_ERROR(cudaMemcpyAsync(K_global_host, K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[0]));
     sync_streams(streams, 1);
     cudaFree(induced_sub_graph);
@@ -353,7 +360,7 @@ int main(int argc, char *argv[]) {
   std::cout << "1: " << n_vertex << "\n";
   std::cout << "2: " << n_edges << "\n";
   for(auto i = 0; i < K_MAX - 2; i++) {
-    std::cout << i + 3 << ": " << K_global_host[i] << "\n";
+    std::cout << i + 3 << ": " << K_global_host[i] % 1000000000 << "\n";
   }
 
   cudaFree(csr.col_array); // dev_b
