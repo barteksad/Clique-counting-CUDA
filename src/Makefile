@@ -34,8 +34,8 @@
 ################################################################################
 
 # Location of the CUDA Toolkit
-# CUDA_PATH ?= "/usr/local/cuda-12.1"
-CUDA_PATH ?= "/usr/local/cuda-11.7"
+CUDA_PATH ?= "/usr/local/cuda-12.1"
+# CUDA_PATH ?= "/usr/local/cuda-11.7"
 
 ##############################
 # start deprecated interface #
@@ -189,6 +189,8 @@ ifeq ($(dbg),1)
       CCFLAGS   += -g -DDEBUG
       BUILD_TYPE := debug
 else
+      NVCCFLAGS += -Xptxas -O3 -DNDEBUG
+      CCFLAGS   += -O3 -DNDEBUG
       BUILD_TYPE := release
 endif
 

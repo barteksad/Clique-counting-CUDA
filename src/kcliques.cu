@@ -48,7 +48,7 @@ struct CSR {
 };
 
 #define D_OUT_MAX 1024U
-#define SUB_WARP_SIZE 16U
+#define SUB_WARP_SIZE 8U
 // OA - orientation approach
 #define OA_WARP_GROUPS 32U
 #define OA_THREADS OA_WARP_GROUPS * SUB_WARP_SIZE
@@ -65,10 +65,12 @@ __global__ void graph_orientation_approach(
   // then we can binsearch to find index of neighbor in induced subgraph
   __shared__ uint32_t vertex2idx[D_OUT_MAX];
 
+  cg::thread_group tile = cg::tiled_partition(cg::this_thread_block(), SUB_WARP_SIZE);
+
   const uint32_t vertex_idx = vertex_idx_offset + blockIdx.x;
   const uint32_t tid = threadIdx.x;
   const uint32_t sub_warp_id = tid / SUB_WARP_SIZE;
-  const uint32_t sub_warp_tid = tid % SUB_WARP_SIZE;
+  const uint32_t sub_warp_tid = tile.thread_rank();
   const size_t isg_offset = blockIdx.x * D_OUT_MAX * (D_OUT_MAX / 32);
   assert(vertex_idx < csr.n_vertex);
   assert(K <= K_MAX);
@@ -88,9 +90,7 @@ __global__ void graph_orientation_approach(
   }
   __syncthreads();
 
-  assert(csr.row_array[vertex_idx + 1] - csr.row_array[vertex_idx] < D_OUT_MAX);
   for(uint32_t i = csr.row_array[vertex_idx] + tid; i < csr.row_array[vertex_idx + 1]; i += blockDim.x) {
-    assert(i - csr.row_array[vertex_idx] < D_OUT_MAX);
     vertex2idx[i - csr.row_array[vertex_idx]] = csr.col_array[i];
   }
   __syncthreads();
@@ -98,7 +98,9 @@ __global__ void graph_orientation_approach(
   // create induced subgraph indicating connection between nodes and store it in shared memory as bitmap, map vertex indexes to interval [0, vertex degree]
   // warp per neighbor
   const uint32_t n_neighbors = csr.row_array[vertex_idx + 1] - csr.row_array[vertex_idx];
-  assert(n_neighbors < D_OUT_MAX);
+  assert(n_neighbors <= D_OUT_MAX);
+  if(n_neighbors == 0)
+    return;
   for(uint32_t neighbor_i = sub_warp_id; neighbor_i < n_neighbors; neighbor_i += OA_WARP_GROUPS) {
     assert(csr.row_array[vertex_idx] + neighbor_i < csr.row_array[vertex_idx + 1]);
     const uint32_t neighbor = csr.col_array[csr.row_array[vertex_idx] + neighbor_i];
@@ -123,19 +125,19 @@ __global__ void graph_orientation_approach(
       curr_neighbor_to_check[sub_warp_id][i] = 0;
     }
 
-    for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
+    for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
       intersections[sub_warp_id][0][i] = induced_sub_graph[isg_offset + warp_subtree * (D_OUT_MAX / 32) + i];
     }
 
-    __syncwarp();
-    for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
+    tile.sync();
+    for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
       uint64_t n_neighbors_k = __popc(intersections[sub_warp_id][0][i]);
       if(n_neighbors_k > 0) {
         atomicAdd(&K_local[0], n_neighbors_k);
       }
     }
 
-    __syncwarp();
+    tile.sync();
 
     uint32_t curr_k = 3;
     while(curr_k >= 2) {
@@ -151,9 +153,9 @@ __global__ void graph_orientation_approach(
       if(sub_warp_tid == 0) {
         next_possible_neighbor[sub_warp_id] = UINT32_MAX;
       }
-      __syncwarp();
+      tile.sync();
 
-      for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
+      for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
         uint32_t x = intersections[sub_warp_id][curr_k - 3][i];
         if(x == 0) {
           continue;
@@ -170,7 +172,7 @@ __global__ void graph_orientation_approach(
           }
         }
       }
-      __syncwarp();
+      tile.sync();
 
       // if no next possible neighbor, backtrack
       uint32_t next = next_possible_neighbor[sub_warp_id];
@@ -186,18 +188,18 @@ __global__ void graph_orientation_approach(
         continue;
       }
 
-      __syncwarp();
+      tile.sync();
 
       if(sub_warp_tid == 0) {
         curr_neighbor_to_check[sub_warp_id][curr_k - 3] = next + 1;
       }
 
-      for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
+      for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
         intersections[sub_warp_id][curr_k - 2][i] = intersections[sub_warp_id][curr_k - 3][i] & induced_sub_graph[isg_offset + next * (D_OUT_MAX / 32) + i];
       }
-      __syncwarp();
+      tile.sync();
 
-      for(uint32_t i = sub_warp_tid; i < D_OUT_MAX / 32; i += SUB_WARP_SIZE) {
+      for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
         uint64_t n_neighbors_k = __popc(intersections[sub_warp_id][curr_k - 2][i]);
         if(n_neighbors_k > 0) {
           atomicAdd(&K_local[curr_k - 2], n_neighbors_k);
@@ -247,6 +249,7 @@ int main(int argc, char *argv[]) {
   cudaDeviceProp prop;
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
   int blocks = prop.multiProcessorCount * 4;
+  std::cout << prop.concurrentKernels << " concurrent kernels\n";
   int warps = prop.warpSize;
   #ifdef DEBUG
   printf("warps: %d\n", warps);
