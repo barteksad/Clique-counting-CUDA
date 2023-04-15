@@ -48,22 +48,27 @@ struct CSR {
 };
 
 #define D_OUT_MAX 1024U
-#define SUB_WARP_SIZE 4U
+#define SUB_WARP_SIZE 8U
 // OA - orientation approach
-#define OA_WARP_GROUPS 64U
+#define OA_WARP_GROUPS 128U
 #define OA_THREADS OA_WARP_GROUPS * SUB_WARP_SIZE
 static_assert(SUB_WARP_SIZE && !(SUB_WARP_SIZE & (SUB_WARP_SIZE - 1)));
 static_assert(D_OUT_MAX % 32 == 0);
-static_assert(D_OUT_MAX % (SUB_WARP_SIZE * OA_WARP_GROUPS) == 0);
 #define K_MAX 11
 
 __global__ void graph_orientation_approach(
-  const CSR csr, const uint32_t vertex_idx_offset, const uint32_t K, unsigned long long int K_global[K_MAX - 2], uint32_t induced_sub_graph[]) {
+  const CSR csr, 
+  const uint32_t vertex_idx_offset, 
+  const uint32_t K, 
+  unsigned long long int K_global[K_MAX - 2], 
+  uint32_t induced_sub_graph[],
+  uint32_t vertex2idx[], // [D_OUT_MAX]
+  uint32_t intersections[] // [OA_WARP_GROUPS][K_MAX - 2][D_OUT_MAX / 32]
+  ) {
   __shared__ unsigned long long int K_local[K_MAX - 2]; 
   // create mapping between original vertex index and index in induced subgraph
   // eg. vertexes [11, 100, 123] -> at indexes [0, 1, 2]
   // then we can binsearch to find index of neighbor in induced subgraph
-  __shared__ uint32_t vertex2idx[D_OUT_MAX];
 
   cg::thread_group tile = cg::tiled_partition(cg::this_thread_block(), SUB_WARP_SIZE);
 
@@ -72,6 +77,8 @@ __global__ void graph_orientation_approach(
   const uint32_t sub_warp_id = tid / SUB_WARP_SIZE;
   const uint32_t sub_warp_tid = tile.thread_rank();
   const size_t isg_offset = blockIdx.x * D_OUT_MAX * (D_OUT_MAX / 32);
+  const size_t v2i_offset = blockIdx.x * D_OUT_MAX;
+  const size_t its_offset = blockIdx.x * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32);
   assert(vertex_idx < csr.n_vertex);
   assert(K <= K_MAX);
   // initialize K_local
@@ -86,12 +93,12 @@ __global__ void graph_orientation_approach(
   }
 
   for(int i = tid; i < D_OUT_MAX; i += blockDim.x) {
-    vertex2idx[i] = UINT32_MAX;
+    vertex2idx[v2i_offset + i] = UINT32_MAX;
   }
   __syncthreads();
 
   for(uint32_t i = csr.row_array[vertex_idx] + tid; i < csr.row_array[vertex_idx + 1]; i += blockDim.x) {
-    vertex2idx[i - csr.row_array[vertex_idx]] = csr.col_array[i];
+    vertex2idx[v2i_offset + i - csr.row_array[vertex_idx]] = csr.col_array[i];
   }
   __syncthreads();
 
@@ -106,7 +113,7 @@ __global__ void graph_orientation_approach(
     const uint32_t neighbor = csr.col_array[csr.row_array[vertex_idx] + neighbor_i];
     for(uint32_t i = csr.row_array[neighbor] + sub_warp_tid; i < csr.row_array[neighbor + 1]; i += SUB_WARP_SIZE) {
       const uint32_t neighbor_neighbor_vertex = csr.col_array[i];
-      const uint32_t neighbor_neighbor_idx = bsearch_dev(vertex2idx, neighbor_neighbor_vertex, n_neighbors);
+      const uint32_t neighbor_neighbor_idx = bsearch_dev(vertex2idx + v2i_offset, neighbor_neighbor_vertex, n_neighbors);
       assert(neighbor_neighbor_idx < n_neighbors || neighbor_neighbor_idx == UINT32_MAX);
       if(neighbor_neighbor_idx != UINT32_MAX) {
         assert(neighbor_neighbor_idx / 32 < D_OUT_MAX / 32);
@@ -118,7 +125,7 @@ __global__ void graph_orientation_approach(
 
   __shared__ uint32_t curr_neighbor_to_check[OA_WARP_GROUPS][K_MAX - 2];
   __shared__ uint32_t next_possible_neighbor[OA_WARP_GROUPS];
-  __shared__ uint32_t intersections[OA_WARP_GROUPS][K_MAX - 2][D_OUT_MAX / 32];
+  // __shared__ uint32_t intersections[OA_WARP_GROUPS][K_MAX - 2][D_OUT_MAX / 32];
 
   for(uint32_t warp_subtree = sub_warp_id; warp_subtree < n_neighbors; warp_subtree += OA_WARP_GROUPS) {
     for(uint32_t i = sub_warp_tid; i < K_MAX - 2; i += SUB_WARP_SIZE) {
@@ -126,12 +133,13 @@ __global__ void graph_orientation_approach(
     }
 
     for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
-      intersections[sub_warp_id][0][i] = induced_sub_graph[isg_offset + warp_subtree * (D_OUT_MAX / 32) + i];
+      // intersections[sub_warp_id][0][i] = induced_sub_graph[isg_offset + warp_subtree * (D_OUT_MAX / 32) + i];
+      intersections[its_offset + sub_warp_id * (K_MAX - 2) * (D_OUT_MAX / 32) + i] = induced_sub_graph[isg_offset + warp_subtree * (D_OUT_MAX / 32) + i];
     }
 
     tile.sync();
     for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
-      uint64_t n_neighbors_k = __popc(intersections[sub_warp_id][0][i]);
+      uint64_t n_neighbors_k = __popc(intersections[its_offset + sub_warp_id * (K_MAX - 2) * (D_OUT_MAX / 32) + i]);
       if(n_neighbors_k > 0) {
         atomicAdd(&K_local[0], n_neighbors_k);
       }
@@ -156,7 +164,8 @@ __global__ void graph_orientation_approach(
       tile.sync();
 
       for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
-        uint32_t x = intersections[sub_warp_id][curr_k - 3][i];
+        // uint32_t x = intersections[sub_warp_id][curr_k - 3][i];
+        uint32_t x = intersections[its_offset + sub_warp_id * (K_MAX - 2) * (D_OUT_MAX / 32) + (curr_k - 3) * (D_OUT_MAX / 32) + i];
         if(x == 0) {
           continue;
         } else {
@@ -195,12 +204,12 @@ __global__ void graph_orientation_approach(
       }
 
       for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
-        intersections[sub_warp_id][curr_k - 2][i] = intersections[sub_warp_id][curr_k - 3][i] & induced_sub_graph[isg_offset + next * (D_OUT_MAX / 32) + i];
+        intersections[its_offset + sub_warp_id * (K_MAX - 2) * (D_OUT_MAX / 32) + (curr_k - 2) * (D_OUT_MAX / 32) + i] = intersections[its_offset + sub_warp_id * (K_MAX - 2) * (D_OUT_MAX / 32) + (curr_k - 3) * (D_OUT_MAX / 32) + i] & induced_sub_graph[isg_offset + next * (D_OUT_MAX / 32) + i];
       }
       tile.sync();
 
       for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
-        uint64_t n_neighbors_k = __popc(intersections[sub_warp_id][curr_k - 2][i]);
+        uint64_t n_neighbors_k = __popc(intersections[its_offset + sub_warp_id * (K_MAX - 2) * (D_OUT_MAX / 32) + (curr_k - 2) * (D_OUT_MAX / 32) + i]);
         if(n_neighbors_k > 0) {
           atomicAdd(&K_local[curr_k - 2], n_neighbors_k);
         }
@@ -253,7 +262,7 @@ int main(int argc, char *argv[]) {
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
   std::cout << prop.concurrentKernels << " concurrentKernels\n";
   std::cout << prop.multiProcessorCount << " multiProcessorCount\n";
-  int blocks = prop.multiProcessorCount * 4;
+  int blocks = prop.multiProcessorCount * 16;
   int warps = prop.warpSize;
   #ifdef DEBUG
   printf("warps: %d\n", warps);
@@ -339,21 +348,27 @@ int main(int argc, char *argv[]) {
   {
     CudaTimer oa_timer("orientation_approach");
     uint32_t *induced_sub_graph;
+    uint32_t *vertex2idx;
+    uint32_t *intersections;
 
     HANDLE_ERROR(cudaMalloc((void**)&K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int)));
     HANDLE_ERROR(cudaMalloc((void**)&induced_sub_graph, blocks * D_OUT_MAX * (D_OUT_MAX / 32) * sizeof(uint32_t)));
+    HANDLE_ERROR(cudaMalloc((void**)&vertex2idx, blocks * D_OUT_MAX * sizeof(uint32_t)));
+    HANDLE_ERROR(cudaMalloc((void**)&intersections, blocks * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32) * sizeof(uint32_t)));
     HANDLE_ERROR(cudaHostAlloc((void**)&K_global_host, (K_MAX - 2) * sizeof(unsigned long long int), cudaHostAllocDefault));
     HANDLE_ERROR(cudaMemset(K_global_dev, 0, (K_MAX - 2) * sizeof(unsigned long long int)));
 
     for(uint32_t vertex_idx = 0; vertex_idx < n_vertex; vertex_idx += blocks) {
       int n_blocks = std::min(n_vertex - vertex_idx, (uint32_t)blocks);
-      graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[0]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph);
+      graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[0]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph, vertex2idx, intersections);
       sync_streams(streams, 1);
     }
 
     HANDLE_ERROR(cudaMemcpyAsync(K_global_host, K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[0]));
     sync_streams(streams, 1);
     cudaFree(induced_sub_graph);
+    cudaFree(vertex2idx);
+    cudaFree(intersections);
   }
 
   std::cout << "K:\n";
