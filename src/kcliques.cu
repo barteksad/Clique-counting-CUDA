@@ -232,7 +232,9 @@ int main(int argc, char *argv[]) {
   std::cout << "K: " << K << std::endl;
   const std::string out_file_path = argv[3];
 
-  const auto [A, B, n_vertex] = read_input(argv[1]);
+  std::vector<uint32_t> A, B;
+  uint32_t n_vertex;
+  std::tie(A, B, n_vertex) = read_input(argv[1]);
   const int n_edges = A.size();
   // we can create histogram array with one more element to use it later as row array for CSR format
   const int CSR_row_size = n_vertex + 1;
