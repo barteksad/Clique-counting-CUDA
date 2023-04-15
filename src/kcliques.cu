@@ -226,7 +226,7 @@ __global__ void graph_orientation_approach(
 }
 
 
-size_t N_STREAMS = 2;
+size_t N_STREAMS = 32;
 
 void sync_streams(cudaStream_t *streams, int n_streams) {
     for(int i = 0; i < n_streams; i++) {
@@ -262,7 +262,7 @@ int main(int argc, char *argv[]) {
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
   std::cout << prop.concurrentKernels << " concurrentKernels\n";
   std::cout << prop.multiProcessorCount << " multiProcessorCount\n";
-  int blocks = prop.multiProcessorCount * 16;
+  int blocks = prop.multiProcessorCount;
   int warps = prop.warpSize;
   #ifdef DEBUG
   printf("warps: %d\n", warps);
@@ -351,18 +351,23 @@ int main(int argc, char *argv[]) {
     uint32_t *vertex2idx;
     uint32_t *intersections;
 
+    size_t isg_size = blocks * D_OUT_MAX * (D_OUT_MAX / 32);
+    size_t v2i_size = blocks * D_OUT_MAX;
+    size_t inter_size = blocks * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32);
+
     HANDLE_ERROR(cudaMalloc((void**)&K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int)));
-    HANDLE_ERROR(cudaMalloc((void**)&induced_sub_graph, blocks * D_OUT_MAX * (D_OUT_MAX / 32) * sizeof(uint32_t)));
-    HANDLE_ERROR(cudaMalloc((void**)&vertex2idx, blocks * D_OUT_MAX * sizeof(uint32_t)));
-    HANDLE_ERROR(cudaMalloc((void**)&intersections, blocks * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32) * sizeof(uint32_t)));
+    HANDLE_ERROR(cudaMalloc((void**)&induced_sub_graph, N_STREAMS * isg_size  * sizeof(uint32_t)));
+    HANDLE_ERROR(cudaMalloc((void**)&vertex2idx, N_STREAMS * v2i_size * sizeof(uint32_t)));
+    HANDLE_ERROR(cudaMalloc((void**)&intersections, N_STREAMS * inter_size * sizeof(uint32_t)));
     HANDLE_ERROR(cudaHostAlloc((void**)&K_global_host, (K_MAX - 2) * sizeof(unsigned long long int), cudaHostAllocDefault));
     HANDLE_ERROR(cudaMemset(K_global_dev, 0, (K_MAX - 2) * sizeof(unsigned long long int)));
 
     for(uint32_t vertex_idx = 0; vertex_idx < n_vertex; vertex_idx += blocks) {
+      size_t s_idx = (vertex_idx / blocks) % N_STREAMS;
       int n_blocks = std::min(n_vertex - vertex_idx, (uint32_t)blocks);
-      graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[0]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph, vertex2idx, intersections);
-      sync_streams(streams, 1);
+      graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[s_idx]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph + s_idx * isg_size, vertex2idx + s_idx * v2i_size, intersections + s_idx * inter_size);
     }
+    sync_streams(streams, N_STREAMS);
 
     HANDLE_ERROR(cudaMemcpyAsync(K_global_host, K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[0]));
     sync_streams(streams, 1);
