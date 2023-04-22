@@ -3,7 +3,7 @@
 #include <thrust/sort.h>
 #include <cooperative_groups.h>
 
-#include "./common/input.h"
+#include "./common/io.h"
 #include "./common/helpers.h"
 #include "./common/timers.h"
 #include "./common/cpu_tests.h"
@@ -66,9 +66,6 @@ __global__ void graph_orientation_approach(
   uint32_t intersections[] // [OA_WARP_GROUPS][K_MAX - 2][D_OUT_MAX / 32]
   ) {
   __shared__ unsigned long long int K_local[K_MAX - 2]; 
-  // create mapping between original vertex index and index in induced subgraph
-  // eg. vertexes [11, 100, 123] -> at indexes [0, 1, 2]
-  // then we can binsearch to find index of neighbor in induced subgraph
 
   cg::thread_group tile = cg::tiled_partition(cg::this_thread_block(), SUB_WARP_SIZE);
 
@@ -92,6 +89,9 @@ __global__ void graph_orientation_approach(
     }
   }
 
+  // create mapping between original vertex index and index in induced subgraph
+  // eg. vertexes [11, 100, 123] -> at indexes [0, 1, 2]
+  // then we can binsearch to find index of neighbor in induced subgraph
   for(int i = tid; i < D_OUT_MAX; i += blockDim.x) {
     vertex2idx[v2i_offset + i] = UINT32_MAX;
   }
@@ -238,12 +238,10 @@ int main(int argc, char *argv[]) {
   CpuTimer timer("main");
 
   const int K = std::stoi(argv[2]);
-  std::cout << "K: " << K << std::endl;
   const std::string out_file_path = argv[3];
 
   std::vector<uint32_t> A, B;
   uint32_t n_vertex;
-  std::cout << "Reading input file: " << argv[1] << std::endl;
   std::tie(A, B, n_vertex) = read_input(argv[1]);
   const int n_edges = A.size();
   // we can create histogram array with one more element to use it later as row array for CSR format
@@ -260,8 +258,6 @@ int main(int argc, char *argv[]) {
   
   cudaDeviceProp prop;
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
-  std::cout << prop.concurrentKernels << " concurrentKernels\n";
-  std::cout << prop.multiProcessorCount << " multiProcessorCount\n";
   int blocks = prop.multiProcessorCount;
   int warps = prop.warpSize;
   #ifdef DEBUG
@@ -282,14 +278,12 @@ int main(int argc, char *argv[]) {
     HANDLE_ERROR(cudaMemset(dev_hist, 0, CSR_row_size * sizeof(uint32_t)));
     HANDLE_ERROR(cudaMemcpyAsync(dev_a, A.data(), n_edges * sizeof(uint32_t), cudaMemcpyHostToDevice, streams[0]));
     HANDLE_ERROR(cudaMemcpyAsync(dev_b, B.data(), n_edges * sizeof(uint32_t), cudaMemcpyHostToDevice, streams[1]));
-    hist_timer.tick("memory management");
 
     int hist_blocks = (n_edges + HIST_ELEM_PER_THREAD * HIST_THREADS) / (HIST_ELEM_PER_THREAD * HIST_THREADS);
 
     histo_kernel<<<hist_blocks, HIST_THREADS, 0, streams[0]>>>(dev_a, n_edges, dev_hist);
     histo_kernel<<<hist_blocks, HIST_THREADS, 0, streams[1]>>>(dev_b, n_edges, dev_hist);
     sync_streams(streams, N_STREAMS);
-
   }
 
   #ifdef DEBUG
@@ -301,7 +295,6 @@ int main(int argc, char *argv[]) {
   for(auto i = 0; i < n_vertex; i++) {
     assert(cpu_hist[i] == host_hist[i]);
   }
-  std::cout << "Histograms on CPU and GPU match!\n";
   cudaFreeHost(host_hist);
   #endif // NDEBUG
   // -- end of histogram computation
@@ -321,7 +314,7 @@ int main(int argc, char *argv[]) {
   // edges_b will become col_array and edges_a will be used to compute row_array which we can store in dev_hist memory since it is not needed anymore
   CSR csr;
   {
-    CudaTimer csr_timer("csr");
+    CudaTimer csr_timer("convert to CSR");
 
     HANDLE_ERROR(cudaMemset(dev_hist, 0, CSR_row_size * sizeof(uint32_t)));
     int hist_blocks = (n_edges + HIST_ELEM_PER_THREAD * HIST_THREADS) / (HIST_ELEM_PER_THREAD * HIST_THREADS);
@@ -351,9 +344,9 @@ int main(int argc, char *argv[]) {
     uint32_t *vertex2idx;
     uint32_t *intersections;
 
-    size_t isg_size = blocks * D_OUT_MAX * (D_OUT_MAX / 32);
-    size_t v2i_size = blocks * D_OUT_MAX;
-    size_t inter_size = blocks * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32);
+    size_t isg_size = blocks * D_OUT_MAX * (D_OUT_MAX / 32); // isg = induced_sub_graph
+    size_t v2i_size = blocks * D_OUT_MAX; // v2i = vertex2idx
+    size_t inter_size = blocks * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32); // inter = intersections
 
     HANDLE_ERROR(cudaMalloc((void**)&K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int)));
     HANDLE_ERROR(cudaMalloc((void**)&induced_sub_graph, N_STREAMS * isg_size  * sizeof(uint32_t)));
@@ -365,7 +358,14 @@ int main(int argc, char *argv[]) {
     for(uint32_t vertex_idx = 0; vertex_idx < n_vertex; vertex_idx += blocks) {
       size_t s_idx = (vertex_idx / blocks) % N_STREAMS;
       int n_blocks = std::min(n_vertex - vertex_idx, (uint32_t)blocks);
-      graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[s_idx]>>>(csr, vertex_idx, K, K_global_dev, induced_sub_graph + s_idx * isg_size, vertex2idx + s_idx * v2i_size, intersections + s_idx * inter_size);
+      graph_orientation_approach<<<n_blocks, OA_THREADS, 0, streams[s_idx]>>>(
+        csr, 
+        vertex_idx, 
+        K, 
+        K_global_dev, 
+        induced_sub_graph + s_idx * isg_size, 
+        vertex2idx + s_idx * v2i_size, 
+        intersections + s_idx * inter_size);
     }
     sync_streams(streams, N_STREAMS);
 
@@ -376,12 +376,7 @@ int main(int argc, char *argv[]) {
     cudaFree(intersections);
   }
 
-  std::cout << "K:\n";
-  std::cout << "1: " << n_vertex << "\n";
-  std::cout << "2: " << n_edges << "\n";
-  for(auto i = 0; i < K_MAX - 2; i++) {
-    std::cout << i + 3 << ": " << K_global_host[i] % 1000000000 << "\n";
-  }
+  write_output(out_file_path, K, n_vertex, n_edges, K_global_host);
 
   cudaFree(csr.col_array); // dev_b
   cudaFree(csr.row_array); // dev_hist
