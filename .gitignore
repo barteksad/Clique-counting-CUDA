@@ -7,5 +7,17 @@
 checks
 src/*.o
 /src/kcliques
+/src/profiler*
+/src/results
 inputs
 .vscode
+bench.txt
+job.sh
+run_batch.sh
+src/profiler
+tests
+input
+$RES
+poprawnosciowe.zip
+run_memcheck.sh
+nvidia
