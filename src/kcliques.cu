@@ -50,7 +50,7 @@ struct CSR {
 #define D_OUT_MAX 1024U // max degree of output graph
 #define SUB_WARP_SIZE 8U // number of threads per sub warp, what is described in paper as threads group
 // OA - orientation approach
-#define OA_WARP_GROUPS 128U // number of thread groups per block
+#define OA_WARP_GROUPS 64U // number of thread groups per block
 #define OA_THREADS OA_WARP_GROUPS * SUB_WARP_SIZE // number of threads per block
 static_assert(SUB_WARP_SIZE && !(SUB_WARP_SIZE & (SUB_WARP_SIZE - 1))); // check if SUB_WARP_SIZE is power of 2
 static_assert(D_OUT_MAX % 32 == 0); 
@@ -66,7 +66,6 @@ __global__ void graph_orientation_approach(
   const uint32_t K, 
   unsigned long long int K_global[K_MAX - 2], 
   uint32_t induced_sub_graph[],
-  uint32_t vertex2idx[], // shape: [D_OUT_MAX]
   // for storing intersections per group at each recurrence level, shape: [OA_WARP_GROUPS][K_MAX - 2][D_OUT_MAX / 32]
   uint32_t intersections[] 
   ) {
@@ -80,7 +79,6 @@ __global__ void graph_orientation_approach(
   const uint32_t sub_warp_id = tid / SUB_WARP_SIZE; // id in threads group
   const uint32_t sub_warp_tid = tile.thread_rank(); // id of threads group
   const size_t isg_offset = blockIdx.x * D_OUT_MAX * (D_OUT_MAX / 32); // offset in induced_sub_graph array
-  const size_t v2i_offset = blockIdx.x * D_OUT_MAX; // offset in vertex2idx array
   const size_t its_offset = blockIdx.x * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32); // offset in intersections array
   assert(vertex_idx < csr.n_vertex);
   assert(K <= K_MAX);
@@ -88,6 +86,7 @@ __global__ void graph_orientation_approach(
   for(int i = tid; i < K_MAX - 2; i += blockDim.x) {
     K_local[i] = 0;
   }
+
 
   // initialize induced_sub_graph
   for(int row = sub_warp_id; row < D_OUT_MAX; row += OA_WARP_GROUPS) {
@@ -99,13 +98,14 @@ __global__ void graph_orientation_approach(
   // create mapping between original vertex index and index in induced subgraph
   // eg. vertexes [11, 100, 123] -> at indexes [0, 1, 2]
   // then we can binsearch to find index of neighbor in induced subgraph
+  __shared__ uint32_t vertex2idx[D_OUT_MAX];
   for(int i = tid; i < D_OUT_MAX; i += blockDim.x) {
-    vertex2idx[v2i_offset + i] = UINT32_MAX; // initialize with out of range value
+    vertex2idx[i] = UINT32_MAX; // initialize with out of range value
   }
   __syncthreads();
 
   for(uint32_t i = csr.row_array[vertex_idx] + tid; i < csr.row_array[vertex_idx + 1]; i += blockDim.x) {
-    vertex2idx[v2i_offset + i - csr.row_array[vertex_idx]] = csr.col_array[i];
+    vertex2idx[i - csr.row_array[vertex_idx]] = csr.col_array[i];
   }
   __syncthreads();
 
@@ -123,7 +123,7 @@ __global__ void graph_orientation_approach(
     for(uint32_t i = csr.row_array[neighbor] + sub_warp_tid; i < csr.row_array[neighbor + 1]; i += SUB_WARP_SIZE) {
       const uint32_t neighbor_neighbor_vertex = csr.col_array[i];
       // find index of neighbor neighbor in vertex2idx array, it becomes its index in induced subgraph
-      const uint32_t neighbor_neighbor_idx = bsearch_dev(vertex2idx + v2i_offset, neighbor_neighbor_vertex, n_neighbors); 
+      const uint32_t neighbor_neighbor_idx = bsearch_dev(vertex2idx, neighbor_neighbor_vertex, n_neighbors); 
       assert(neighbor_neighbor_idx < n_neighbors || neighbor_neighbor_idx == UINT32_MAX);
       // if neighbor neighbor is neighbor of vertex, set bit in induced subgraph
       if(neighbor_neighbor_idx != UINT32_MAX) {
@@ -360,16 +360,13 @@ int main(int argc, char *argv[]) {
   {
     CudaTimer oa_timer("orientation_approach");
     uint32_t *induced_sub_graph;
-    uint32_t *vertex2idx;
     uint32_t *intersections;
 
     size_t isg_size = blocks * D_OUT_MAX * (D_OUT_MAX / 32); // isg = induced_sub_graph
-    size_t v2i_size = blocks * D_OUT_MAX; // v2i = vertex2idx
     size_t inter_size = blocks * OA_WARP_GROUPS * (K_MAX - 2) * (D_OUT_MAX / 32); // inter = intersections
 
     HANDLE_ERROR(cudaMalloc((void**)&K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int)));
     HANDLE_ERROR(cudaMalloc((void**)&induced_sub_graph, N_STREAMS * isg_size  * sizeof(uint32_t)));
-    HANDLE_ERROR(cudaMalloc((void**)&vertex2idx, N_STREAMS * v2i_size * sizeof(uint32_t)));
     HANDLE_ERROR(cudaMalloc((void**)&intersections, N_STREAMS * inter_size * sizeof(uint32_t)));
     HANDLE_ERROR(cudaHostAlloc((void**)&K_global_host, (K_MAX - 2) * sizeof(unsigned long long int), cudaHostAllocDefault));
     HANDLE_ERROR(cudaMemset(K_global_dev, 0, (K_MAX - 2) * sizeof(unsigned long long int)));
@@ -383,7 +380,6 @@ int main(int argc, char *argv[]) {
         K, 
         K_global_dev, 
         induced_sub_graph + s_idx * isg_size, 
-        vertex2idx + s_idx * v2i_size, 
         intersections + s_idx * inter_size);
     }
     sync_streams(streams, N_STREAMS);
@@ -391,7 +387,6 @@ int main(int argc, char *argv[]) {
     HANDLE_ERROR(cudaMemcpyAsync(K_global_host, K_global_dev, (K_MAX - 2) * sizeof(unsigned long long int), cudaMemcpyDeviceToHost, streams[0]));
     sync_streams(streams, 1);
     cudaFree(induced_sub_graph);
-    cudaFree(vertex2idx);
     cudaFree(intersections);
   }
 
