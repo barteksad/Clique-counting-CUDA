@@ -6,7 +6,6 @@
 #include "./common/io.h"
 #include "./common/helpers.h"
 #include "./common/timers.h"
-#include "./common/cpu_tests.h"
 
 namespace cg = cooperative_groups;
 
@@ -50,10 +49,11 @@ struct CSR {
 #define D_OUT_MAX 1024U // max degree of output graph
 #define SUB_WARP_SIZE 8U // number of threads per sub warp, what is described in paper as threads group
 // OA - orientation approach
-#define OA_WARP_GROUPS 64U // number of thread groups per block
+#define OA_WARP_GROUPS 128U // number of thread groups per block
 #define OA_THREADS OA_WARP_GROUPS * SUB_WARP_SIZE // number of threads per block
 static_assert(SUB_WARP_SIZE && !(SUB_WARP_SIZE & (SUB_WARP_SIZE - 1))); // check if SUB_WARP_SIZE is power of 2
 static_assert(D_OUT_MAX % 32 == 0); 
+static_assert(OA_THREADS <= 1024);
 #define K_MAX 11
 
 // helper macros for indexing flat nd arrays
@@ -86,7 +86,6 @@ __global__ void graph_orientation_approach(
   for(int i = tid; i < K_MAX - 2; i += blockDim.x) {
     K_local[i] = 0;
   }
-
 
   // initialize induced_sub_graph
   for(int row = sub_warp_id; row < D_OUT_MAX; row += OA_WARP_GROUPS) {
@@ -137,7 +136,7 @@ __global__ void graph_orientation_approach(
   // for each group and recurrence level, store the number of lowest not checked neighbor
   __shared__ uint32_t curr_neighbor_to_check[OA_WARP_GROUPS][K_MAX - 2];
   // used to find next possible neighbor at each level
-  __shared__ uint32_t next_possible_neighbor[OA_WARP_GROUPS];
+  __shared__ uint32_t next_possible_neighbor[OA_WARP_GROUPS]; 
 
   for(uint32_t warp_subtree = sub_warp_id; warp_subtree < n_neighbors; warp_subtree += OA_WARP_GROUPS) {
     // initialize curr_neighbor_to_check with 0 since we haven't checked any neighbor yet
@@ -153,7 +152,7 @@ __global__ void graph_orientation_approach(
     tile.sync();
     // count 3-cliques
     for(uint32_t i = sub_warp_tid; i <= (n_neighbors - 1) / 32; i += SUB_WARP_SIZE) {
-      uint64_t n_neighbors_k = __popc(idx_intersections(intersections, its_offset , sub_warp_id, 0, i));
+      uint64_t n_neighbors_k = __popc(idx_intersections(intersections, its_offset, sub_warp_id, 0, i));
       if(n_neighbors_k > 0) {
         atomicAdd(&K_local[0], n_neighbors_k);
       }
@@ -213,7 +212,7 @@ __global__ void graph_orientation_approach(
         continue;
       }
 
-      tile.sync();
+      // tile.sync();
 
       // in next recursion level, start checking from next + 1
       if(sub_warp_tid == 0) {
@@ -266,10 +265,6 @@ int main(int argc, char *argv[]) {
   // we can create histogram array with one more element to use it later as row array for CSR format
   const int CSR_row_size = n_vertex + 1;
 
-  #ifdef DEBUG
-  std::cout << "n_vertex: " << n_vertex << " n_edges: " << n_edges << std::endl;
-  #endif // DEBUG
-
   cudaStream_t streams[N_STREAMS];
   for(int i = 0; i < N_STREAMS; i++) {
       cudaStreamCreate(&streams[i]);
@@ -277,15 +272,9 @@ int main(int argc, char *argv[]) {
   
   cudaDeviceProp prop;
   HANDLE_ERROR(cudaGetDeviceProperties(&prop, 0));
-  int blocks = prop.multiProcessorCount;
-  int warps = prop.warpSize;
-  #ifdef DEBUG
-  printf("warps: %d\n", warps);
-  printf("blocks: %d\n", blocks);
-  #endif // DEBUG
+  int blocks = prop.multiProcessorCount * 2;
 
   // compute histogram to count nodes degrees
-  uint32_t *host_hist;
   uint32_t *dev_hist, *dev_a, *dev_b;
   {
     CudaTimer hist_timer("histogram gpu");
@@ -304,18 +293,6 @@ int main(int argc, char *argv[]) {
     histo_kernel<<<hist_blocks, HIST_THREADS, 0, streams[1]>>>(dev_b, n_edges, dev_hist);
     sync_streams(streams, N_STREAMS);
   }
-
-  #ifdef DEBUG
-  HANDLE_ERROR(cudaHostAlloc((void**)&host_hist, CSR_row_size * sizeof(uint32_t), cudaHostAllocDefault));
-  HANDLE_ERROR(cudaMemcpyAsync(host_hist, dev_hist, CSR_row_size * sizeof(uint32_t), cudaMemcpyDeviceToHost, streams[0]));
-  sync_streams(streams, 1);
-
-  auto cpu_hist = histogram_cpu(A, B, n_vertex);
-  for(auto i = 0; i < n_vertex; i++) {
-    assert(cpu_hist[i] == host_hist[i]);
-  }
-  cudaFreeHost(host_hist);
-  #endif // NDEBUG
   // -- end of histogram computation
 
 
